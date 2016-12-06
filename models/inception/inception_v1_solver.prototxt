@@ -1,0 +1,22 @@
+net: "models/inception/inception_v1_trainval.prototxt"
+
+test_iter: 2500
+test_interval: 1000
+test_initialization: true
+
+display: 20
+average_loss: 20
+
+base_lr: 0.4
+lr_policy: "smoothstep"
+gamma: 0.1
+stepsize: 200000
+max_iter: 600000
+
+momentum: 0.9
+weight_decay: 0.0001
+
+snapshot: 10000
+snapshot_prefix: "examples/imagenet/snapshots/inception/inception_v1"
+
+solver_mode: GPU
