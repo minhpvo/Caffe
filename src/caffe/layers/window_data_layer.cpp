@@ -1,3 +1,4 @@
+#ifdef USE_OPENCV
 #include <opencv2/highgui/highgui_c.h>
 #include <stdint.h>
 
@@ -11,9 +12,10 @@
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 
-#include "caffe/common.hpp"
-#include "caffe/data_layers.hpp"
-#include "caffe/layer.hpp"
+#include "caffe/data_transformer.hpp"
+#include "caffe/internal_thread.hpp"
+#include "caffe/layers/base_data_layer.hpp"
+#include "caffe/layers/window_data_layer.hpp"
 #include "caffe/util/benchmark.hpp"
 #include "caffe/util/io.hpp"
 #include "caffe/util/math_functions.hpp"
@@ -27,7 +29,7 @@ namespace caffe {
 
 template <typename Dtype>
 WindowDataLayer<Dtype>::~WindowDataLayer<Dtype>() {
-  this->JoinPrefetchThread();
+  this->StopInternalThread();
 }
 
 template <typename Dtype>
@@ -48,20 +50,6 @@ void WindowDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
   //    num_windows
   //    class_index overlap x1 y1 x2 y2
 
-#ifdef USE_MPI
-  if (Caffe::mpi_size() > 1) {
-    if (this->layer_param_.window_data_param().batch_size()
-        % Caffe::mpi_size() != 0) {
-      LOG(FATAL) << "Batch size ("
-                 << this->layer_param_.window_data_param().batch_size()
-                 << ") should be divisible by the number of MPI processes ("
-                 << Caffe::mpi_size() << ")";
-    }
-    this->layer_param_.mutable_window_data_param()->set_batch_size(
-        this->layer_param_.window_data_param().batch_size() / Caffe::mpi_size());
-  }
-#endif
-
   LOG(INFO) << "Window data layer:" << std::endl
       << "  foreground (object) overlap threshold: "
       << this->layer_param_.window_data_param().fg_threshold() << std::endl
@@ -79,9 +67,7 @@ void WindowDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
 
   const bool prefetch_needs_rand =
       this->transform_param_.mirror() ||
-      this->transform_param_.crop_size() ||
-      this->transform_param_.crop_height() ||
-      this->transform_param_.crop_width();
+      this->transform_param_.crop_size();
   if (prefetch_needs_rand) {
     const unsigned int prefetch_rng_seed = caffe_rng_rand();
     prefetch_rng_.reset(new Caffe::RNG(prefetch_rng_seed));
@@ -184,15 +170,12 @@ void WindowDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
 
   // image
   const int crop_size = this->transform_param_.crop_size();
-  int crop_height = this->layer_param_.transform_param().crop_height() > 0 ?
-        this->layer_param_.transform_param().crop_height() : crop_size;
-  int crop_width = this->layer_param_.transform_param().crop_width() > 0 ?
-        this->layer_param_.transform_param().crop_width() : crop_size;
-  CHECK_GT(crop_height, 0);
-  CHECK_GT(crop_width, 0);
+  CHECK_GT(crop_size, 0);
   const int batch_size = this->layer_param_.window_data_param().batch_size();
-  top[0]->Reshape(batch_size, channels, crop_height, crop_width);
-  this->prefetch_data_.Reshape(batch_size, channels, crop_height, crop_width);
+  top[0]->Reshape(batch_size, channels, crop_size, crop_size);
+  for (int i = 0; i < this->PREFETCH_COUNT; ++i)
+    this->prefetch_[i].data_.Reshape(
+        batch_size, channels, crop_size, crop_size);
 
   LOG(INFO) << "output data size: " << top[0]->num() << ","
       << top[0]->channels() << "," << top[0]->height() << ","
@@ -200,7 +183,9 @@ void WindowDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
   // label
   vector<int> label_shape(1, batch_size);
   top[1]->Reshape(label_shape);
-  this->prefetch_label_.Reshape(label_shape);
+  for (int i = 0; i < this->PREFETCH_COUNT; ++i) {
+    this->prefetch_[i].label_.Reshape(label_shape);
+  }
 
   // data mean
   has_mean_file_ = this->transform_param_.has_mean_file();
@@ -238,9 +223,9 @@ unsigned int WindowDataLayer<Dtype>::PrefetchRand() {
   return (*prefetch_rng)();
 }
 
-// Thread fetching the data
+// This function is called on prefetch thread
 template <typename Dtype>
-void WindowDataLayer<Dtype>::InternalThreadEntry() {
+void WindowDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
   // At each iteration, sample N windows where N*p are foreground (object)
   // windows and N*(1-p) are background (non-object) windows
   CPUTimer batch_timer;
@@ -248,38 +233,32 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
   double read_time = 0;
   double trans_time = 0;
   CPUTimer timer;
-  Dtype* top_data = this->prefetch_data_.mutable_cpu_data();
-  Dtype* top_label = this->prefetch_label_.mutable_cpu_data();
+  Dtype* top_data = batch->data_.mutable_cpu_data();
+  Dtype* top_label = batch->label_.mutable_cpu_data();
   const Dtype scale = this->layer_param_.window_data_param().scale();
   const int batch_size = this->layer_param_.window_data_param().batch_size();
   const int context_pad = this->layer_param_.window_data_param().context_pad();
   const int crop_size = this->transform_param_.crop_size();
-  int crop_height = this->layer_param_.transform_param().crop_height() > 0 ?
-        this->layer_param_.transform_param().crop_height() : crop_size;
-  int crop_width = this->layer_param_.transform_param().crop_width() > 0 ?
-        this->layer_param_.transform_param().crop_width() : crop_size;
   const bool mirror = this->transform_param_.mirror();
   const float fg_fraction =
       this->layer_param_.window_data_param().fg_fraction();
   Dtype* mean = NULL;
-  int mean_h_off = 0;
-  int mean_w_off = 0;
+  int mean_off = 0;
   int mean_width = 0;
   int mean_height = 0;
   if (this->has_mean_file_) {
     mean = this->data_mean_.mutable_cpu_data();
-    mean_h_off = (this->data_mean_.height() - crop_height) / 2;
-    mean_w_off = (this->data_mean_.width() - crop_width) / 2;
+    mean_off = (this->data_mean_.width() - crop_size) / 2;
     mean_width = this->data_mean_.width();
     mean_height = this->data_mean_.height();
   }
-  cv::Size cv_crop_size(crop_height, crop_width);
+  cv::Size cv_crop_size(crop_size, crop_size);
   const string& crop_mode = this->layer_param_.window_data_param().crop_mode();
 
   bool use_square = (crop_mode == "square") ? true : false;
 
   // zero out batch
-  caffe_set(this->prefetch_data_.count(), Dtype(0), top_data);
+  caffe_set(batch->data_.count(), Dtype(0), top_data);
 
   const int num_fg = static_cast<int>(static_cast<float>(batch_size)
       * fg_fraction);
@@ -328,12 +307,10 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
       int pad_h = 0;
       if (context_pad > 0 || use_square) {
         // scale factor by which to expand the original region
-        // such that after warping the expanded region to crop_height x crop_width
+        // such that after warping the expanded region to crop_size x crop_size
         // there's exactly context_pad amount of padding on each side
-        Dtype context_h_scale = static_cast<Dtype>(crop_height) /
-            static_cast<Dtype>(crop_height - 2*context_pad);
-        Dtype context_w_scale = static_cast<Dtype>(crop_width) /
-            static_cast<Dtype>(crop_width - 2*context_pad);
+        Dtype context_scale = static_cast<Dtype>(crop_size) /
+            static_cast<Dtype>(crop_size - 2*context_pad);
 
         // compute the expanded region
         Dtype half_height = static_cast<Dtype>(y2-y1+1)/2.0;
@@ -347,10 +324,10 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
             half_height = half_width;
           }
         }
-        x1 = static_cast<int>(round(center_x - half_width*context_w_scale));
-        x2 = static_cast<int>(round(center_x + half_width*context_w_scale));
-        y1 = static_cast<int>(round(center_y - half_height*context_h_scale));
-        y2 = static_cast<int>(round(center_y + half_height*context_h_scale));
+        x1 = static_cast<int>(round(center_x - half_width*context_scale));
+        x2 = static_cast<int>(round(center_x + half_width*context_scale));
+        y1 = static_cast<int>(round(center_y - half_height*context_scale));
+        y2 = static_cast<int>(round(center_y + half_height*context_scale));
 
         // the expanded region may go outside of the image
         // so we compute the clipped (expanded) region and keep track of
@@ -377,9 +354,9 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
         // scale factors that would be used to warp the unclipped
         // expanded region
         Dtype scale_x =
-            static_cast<Dtype>(crop_width)/static_cast<Dtype>(unclipped_width);
+            static_cast<Dtype>(crop_size)/static_cast<Dtype>(unclipped_width);
         Dtype scale_y =
-            static_cast<Dtype>(crop_height)/static_cast<Dtype>(unclipped_height);
+            static_cast<Dtype>(crop_size)/static_cast<Dtype>(unclipped_height);
 
         // size to warp the clipped expanded region to
         cv_crop_size.width =
@@ -400,12 +377,12 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
         }
 
         // ensure that the warped, clipped region plus the padding fits in the
-        // crop_height x crop_width image (it might not due to rounding)
-        if (pad_h + cv_crop_size.height > crop_height) {
-          cv_crop_size.height = crop_height - pad_h;
+        // crop_size x crop_size image (it might not due to rounding)
+        if (pad_h + cv_crop_size.height > crop_size) {
+          cv_crop_size.height = crop_size - pad_h;
         }
-        if (pad_w + cv_crop_size.width > crop_width) {
-          cv_crop_size.width = crop_width - pad_w;
+        if (pad_w + cv_crop_size.width > crop_size) {
+          cv_crop_size.width = crop_size - pad_w;
         }
       }
 
@@ -425,13 +402,13 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
         int img_index = 0;
         for (int w = 0; w < cv_cropped_img.cols; ++w) {
           for (int c = 0; c < channels; ++c) {
-            int top_index = ((item_id * channels + c) * crop_height + h + pad_h)
-                     * crop_width + w + pad_w;
+            int top_index = ((item_id * channels + c) * crop_size + h + pad_h)
+                     * crop_size + w + pad_w;
             // int top_index = (c * height + h) * width + w;
             Dtype pixel = static_cast<Dtype>(ptr[img_index++]);
             if (this->has_mean_file_) {
-              int mean_index = (c * mean_height + h + mean_h_off + pad_h)
-                           * mean_width + w + mean_w_off + pad_w;
+              int mean_index = (c * mean_height + h + mean_off + pad_h)
+                           * mean_width + w + mean_off + pad_w;
               top_data[top_index] = (pixel - mean[mean_index]) * scale;
             } else {
               if (this->has_mean_values_) {
@@ -468,11 +445,11 @@ void WindowDataLayer<Dtype>::InternalThreadEntry() {
           string("_data.txt")).c_str(),
           std::ofstream::out | std::ofstream::binary);
       for (int c = 0; c < channels; ++c) {
-        for (int h = 0; h < crop_height; ++h) {
-          for (int w = 0; w < crop_width; ++w) {
+        for (int h = 0; h < crop_size; ++h) {
+          for (int w = 0; w < crop_size; ++w) {
             top_data_file.write(reinterpret_cast<char*>(
-                &top_data[((item_id * channels + c) * crop_height + h)
-                          * crop_width + w]),
+                &top_data[((item_id * channels + c) * crop_size + h)
+                          * crop_size + w]),
                 sizeof(Dtype));
           }
         }
@@ -493,3 +470,4 @@ INSTANTIATE_CLASS(WindowDataLayer);
 REGISTER_LAYER_CLASS(WindowData);
 
 }  // namespace caffe
+#endif  // USE_OPENCV

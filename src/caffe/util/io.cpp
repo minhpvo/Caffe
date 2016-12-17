@@ -2,10 +2,12 @@
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/text_format.h>
+#ifdef USE_OPENCV
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/highgui/highgui_c.h>
 #include <opencv2/imgproc/imgproc.hpp>
+#endif  // USE_OPENCV
 #include <stdint.h>
 
 #include <algorithm>
@@ -67,66 +69,23 @@ void WriteProtoToBinaryFile(const Message& proto, const char* filename) {
   CHECK(proto.SerializeToOstream(&output));
 }
 
+#ifdef USE_OPENCV
 cv::Mat ReadImageToCVMat(const string& filename,
-    const int w_off, const int h_off,
-    const int crop_width, const int crop_height,
-    const int context_pad_height, const int context_pad_width,
     const int height, const int width, const bool is_color) {
   cv::Mat cv_img;
-  int cv_read_flag = (is_color ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
+  int cv_read_flag = (is_color ? CV_LOAD_IMAGE_COLOR :
+    CV_LOAD_IMAGE_GRAYSCALE);
   cv::Mat cv_img_origin = cv::imread(filename, cv_read_flag);
   if (!cv_img_origin.data) {
     LOG(ERROR) << "Could not open or find file " << filename;
     return cv_img_origin;
   }
-  cv::Mat cv_cropped_img = cv_img_origin;
-  if (crop_width > 0 && crop_height > 0) {
-    if (w_off >= 0 && w_off + crop_width <= cv_img_origin.cols &&
-        h_off >= 0 && h_off + crop_height <= cv_img_origin.rows) {
-      int x = w_off;
-      int y = h_off;
-      int w = crop_width;
-      int h = crop_height;
-      if (context_pad_height > 0 || context_pad_width > 0) {
-        // Compute the padding for the either side of the original image.
-        // The bbox to be cropped will always be centered.
-        int pad_h = context_pad_height / 2;
-        int pad_w = context_pad_width / 2;
-        if (height > 0 && width > 0) {
-          pad_h = context_pad_height * crop_height * 0.5 /
-                  (height - context_pad_height);
-          pad_w = context_pad_width * crop_width * 0.5 /
-                  (width - context_pad_width);
-        }
-        // Reduce the padding if it is out of the image boundary.
-        // Reserve symmetry.
-        pad_w = std::min<int>(pad_w,
-            std::min<int>(w_off, cv_img_origin.cols - w_off - crop_width));
-        pad_h = std::min<int>(pad_h,
-            std::min<int>(h_off, cv_img_origin.rows - h_off - crop_height));
-        x -= pad_w;
-        y -= pad_h;
-        w += 2 * pad_w;
-        h += 2 * pad_h;
-      }
-      cv::Rect roi(x, y, w, h);
-      cv_cropped_img = cv_img_origin(roi);
-    } else {
-      LOG(INFO) << "BBox out of range " << filename;
-    }
-  }
   if (height > 0 && width > 0) {
-    cv::resize(cv_cropped_img, cv_img, cv::Size(width, height));
+    cv::resize(cv_img_origin, cv_img, cv::Size(width, height));
   } else {
-    cv_img = cv_cropped_img;
+    cv_img = cv_img_origin;
   }
   return cv_img;
-}
-
-cv::Mat ReadImageToCVMat(const string& filename,
-    const int height, const int width, const bool is_color) {
-  return ReadImageToCVMat(filename, -1, -1, 0, 0, 0, 0,
-                          height, width, is_color);
 }
 
 cv::Mat ReadImageToCVMat(const string& filename,
@@ -141,50 +100,6 @@ cv::Mat ReadImageToCVMat(const string& filename,
 
 cv::Mat ReadImageToCVMat(const string& filename) {
   return ReadImageToCVMat(filename, 0, 0, true);
-}
-
-cv::Mat ReadImageToCVMatResizeShortSide(const string& filename,
-    const int w_off, const int h_off,
-    const int crop_width, const int crop_height,
-    const int short_side, const bool is_color) {
-  cv::Mat cv_img;
-  int cv_read_flag = (is_color ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
-  cv::Mat cv_img_origin = cv::imread(filename, cv_read_flag);
-  if (!cv_img_origin.data) {
-    LOG(ERROR) << "Could not open or find file " << filename;
-    return cv_img_origin;
-  }
-  cv::Mat cv_cropped_img = cv_img_origin;
-  if (crop_width > 0 && crop_height > 0) {
-    if (w_off >= 0 && w_off + crop_width <= cv_img_origin.cols &&
-        h_off >= 0 && h_off + crop_height <= cv_img_origin.rows) {
-      cv::Rect roi(w_off, h_off, crop_width, crop_height);
-      cv_cropped_img = cv_img_origin(roi);
-    } else {
-      LOG(INFO) << "BBox out of range " << filename;
-    }
-  }
-  if (short_side > 0) {
-    int width = cv_cropped_img.cols;
-    int height = cv_cropped_img.rows;
-    if (width < height) {
-      height = static_cast<int>(short_side * (height * 1.0 / width) + 0.5);
-      width = short_side;
-    } else {
-      width = static_cast<int>(short_side * (width * 1.0 / height) + 0.5);
-      height = short_side;
-    }
-    cv::resize(cv_cropped_img, cv_img, cv::Size(width, height));
-  } else {
-    cv_img = cv_cropped_img;
-  }
-  return cv_img;
-}
-
-cv::Mat ReadImageToCVMatResizeShortSide(const string& filename,
-    const int short_side, const bool is_color) {
-  return ReadImageToCVMatResizeShortSide(filename, -1, -1, 0, 0,
-                                         short_side, is_color);
 }
 
 // Do the file extension and encoding match?
@@ -202,19 +117,13 @@ static bool matchExt(const std::string & fn,
 }
 
 bool ReadImageToDatum(const string& filename, const int label,
-    const int w_off, const int h_off,
-    const int crop_width, const int crop_height,
-    const int context_pad_height, const int context_pad_width,
     const int height, const int width, const bool is_color,
     const std::string & encoding, Datum* datum) {
-  cv::Mat cv_img = ReadImageToCVMat(filename, w_off, h_off,
-                                    crop_width, crop_height,
-                                    context_pad_height, context_pad_width,
-                                    height, width, is_color);
+  cv::Mat cv_img = ReadImageToCVMat(filename, height, width, is_color);
   if (cv_img.data) {
     if (encoding.size()) {
       if ( (cv_img.channels() == 3) == is_color && !height && !width &&
-          !crop_width && !crop_height && matchExt(filename, encoding) )
+          matchExt(filename, encoding) )
         return ReadFileToDatum(filename, label, datum);
       std::vector<uchar> buf;
       cv::imencode("."+encoding, cv_img, buf);
@@ -231,35 +140,7 @@ bool ReadImageToDatum(const string& filename, const int label,
     return false;
   }
 }
-
-bool ReadImageToDatumResizeShortSide(const string& filename, const int label,
-    const int w_off, const int h_off,
-    const int crop_width, const int crop_height,
-    const int short_side, const bool is_color,
-    const std::string & encoding, Datum* datum) {
-  cv::Mat cv_img = ReadImageToCVMatResizeShortSide(filename, w_off, h_off,
-                                                   crop_width, crop_height,
-                                                   short_side, is_color);
-  if (cv_img.data) {
-    if (encoding.size()) {
-      if ( (cv_img.channels() == 3) == is_color && !short_side &&
-          !crop_width && !crop_height && matchExt(filename, encoding) )
-        return ReadFileToDatum(filename, label, datum);
-      std::vector<uchar> buf;
-      cv::imencode("."+encoding, cv_img, buf);
-      datum->set_data(std::string(reinterpret_cast<char*>(&buf[0]),
-                      buf.size()));
-      datum->set_label(label);
-      datum->set_encoded(true);
-      return true;
-    }
-    CVMatToDatum(cv_img, datum);
-    datum->set_label(label);
-    return true;
-  } else {
-    return false;
-  }
-}
+#endif  // USE_OPENCV
 
 bool ReadFileToDatum(const string& filename, const int label,
     Datum* datum) {
@@ -281,6 +162,7 @@ bool ReadFileToDatum(const string& filename, const int label,
   }
 }
 
+#ifdef USE_OPENCV
 cv::Mat DecodeDatumToCVMatNative(const Datum& datum) {
   cv::Mat cv_img;
   CHECK(datum.encoded()) << "Datum not encoded";
@@ -292,7 +174,6 @@ cv::Mat DecodeDatumToCVMatNative(const Datum& datum) {
   }
   return cv_img;
 }
-
 cv::Mat DecodeDatumToCVMat(const Datum& datum, bool is_color) {
   cv::Mat cv_img;
   CHECK(datum.encoded()) << "Datum not encoded";
@@ -353,6 +234,5 @@ void CVMatToDatum(const cv::Mat& cv_img, Datum* datum) {
   }
   datum->set_data(buffer);
 }
-
-
+#endif  // USE_OPENCV
 }  // namespace caffe

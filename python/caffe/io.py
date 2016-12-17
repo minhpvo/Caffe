@@ -20,23 +20,26 @@ def blobproto_to_array(blob, return_diff=False):
     Convert a blob proto to an array. In default, we will just return the data,
     unless return_diff is True, in which case we will return the diff.
     """
+    # Read the data into an array
     if return_diff:
-        return np.array(blob.diff).reshape(
-            blob.num, blob.channels, blob.height, blob.width)
+        data = np.array(blob.diff)
     else:
-        return np.array(blob.data).reshape(
-            blob.num, blob.channels, blob.height, blob.width)
+        data = np.array(blob.data)
 
+    # Reshape the array
+    if blob.HasField('num') or blob.HasField('channels') or blob.HasField('height') or blob.HasField('width'):
+        # Use legacy 4D shape
+        return data.reshape(blob.num, blob.channels, blob.height, blob.width)
+    else:
+        return data.reshape(blob.shape.dim)
 
 def array_to_blobproto(arr, diff=None):
-    """Converts a 4-dimensional array to blob proto. If diff is given, also
+    """Converts a N-dimensional array to blob proto. If diff is given, also
     convert the diff. You need to make sure that arr and diff have the same
     shape, and this function does not do sanity check.
     """
-    if arr.ndim != 4:
-        raise ValueError('Incorrect array shape.')
     blob = caffe_pb2.BlobProto()
-    blob.num, blob.channels, blob.height, blob.width = arr.shape
+    blob.shape.dim.extend(arr.shape)
     blob.data.extend(arr.astype(float).flat)
     if diff is not None:
         blob.diff.extend(diff.astype(float).flat)
@@ -175,9 +178,9 @@ class Transformer:
         if raw_scale is not None:
             decaf_in /= raw_scale
         if channel_swap is not None:
-            decaf_in = decaf_in[channel_swap, :, :]
+            decaf_in = decaf_in[np.argsort(channel_swap), :, :]
         if transpose is not None:
-            decaf_in = decaf_in.transpose([transpose[t] for t in transpose])
+            decaf_in = decaf_in.transpose(np.argsort(transpose))
         return decaf_in
 
     def set_transpose(self, in_, order):
@@ -289,7 +292,7 @@ def load_image(filename, color=True):
         of size (H x W x 3) in RGB or
         of size (H x W x 1) in grayscale.
     """
-    img = skimage.img_as_float(skimage.io.imread(filename)).astype(np.float32)
+    img = skimage.img_as_float(skimage.io.imread(filename, as_grey=not color)).astype(np.float32)
     if img.ndim == 2:
         img = img[:, :, np.newaxis]
         if color:
@@ -329,7 +332,7 @@ def resize_image(im, new_dims, interp_order=1):
             return ret
     else:
         # ndimage interpolates anything but more slowly.
-        scale = tuple(np.array(new_dims) / np.array(im.shape[:2]))
+        scale = tuple(np.array(new_dims, dtype=float) / np.array(im.shape[:2]))
         resized_im = zoom(im, scale + (1,), order=interp_order)
     return resized_im.astype(np.float32)
 
@@ -347,32 +350,31 @@ def oversample(images, crop_dims):
     -------
     crops : (10*N x H x W x K) ndarray of crops for number of inputs N.
     """
+    # Dimensions and center.
+    im_shape = np.array(images[0].shape)
+    crop_dims = np.array(crop_dims)
+    im_center = im_shape[:2] / 2.0
+
+    # Make crop coordinates
+    h_indices = (0, im_shape[0] - crop_dims[0])
+    w_indices = (0, im_shape[1] - crop_dims[1])
+    crops_ix = np.empty((5, 4), dtype=int)
+    curr = 0
+    for i in h_indices:
+        for j in w_indices:
+            crops_ix[curr] = (i, j, i + crop_dims[0], j + crop_dims[1])
+            curr += 1
+    crops_ix[4] = np.tile(im_center, (1, 2)) + np.concatenate([
+        -crop_dims / 2.0,
+         crop_dims / 2.0
+    ])
+    crops_ix = np.tile(crops_ix, (2, 1))
 
     # Extract crops
-    crop_dims = np.array(crop_dims)
     crops = np.empty((10 * len(images), crop_dims[0], crop_dims[1],
-                      images[0].shape[-1]), dtype=np.float32)
+                      im_shape[-1]), dtype=np.float32)
     ix = 0
     for im in images:
-        # Dimensions and center.
-        im_shape = np.array(im.shape)
-        im_center = im_shape[:2] / 2.0
-
-        # Make crop coordinates
-        h_indices = (0, im_shape[0] - crop_dims[0])
-        w_indices = (0, im_shape[1] - crop_dims[1])
-        crops_ix = np.empty((5, 4), dtype=int)
-        curr = 0
-        for i in h_indices:
-            for j in w_indices:
-                crops_ix[curr] = (i, j, i + crop_dims[0], j + crop_dims[1])
-                curr += 1
-        crops_ix[4] = np.tile(im_center, (1, 2)) + np.concatenate([
-            -crop_dims / 2.0,
-             crop_dims / 2.0
-        ])
-        crops_ix = np.tile(crops_ix, (2, 1))
-
         for crop in crops_ix:
             crops[ix] = im[crop[0]:crop[2], crop[1]:crop[3], :]
             ix += 1

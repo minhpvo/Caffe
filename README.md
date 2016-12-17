@@ -1,58 +1,21 @@
-This is my own development branch. It merges the mpi-parallel and the batch-normalization branches, and adds some other things such as the python script (tools/show_log.py) to plot the training curves.
+# Deep Metric Learning via Lifted Structured Feature Embedding
+This repository is an extension of [Caffe](https://github.com/bvlc/caffe) for the paper "Deep Metric Learning via Lifted Structured Feature Embedding" (CVPR16). Also, this is a Github submodule for the main repository at [Deep-Metric-Learning-CVPR16](https://github.com/rksltnl/Deep-Metric-Learning-CVPR16). 
 
-Below are the README merged from the mpi-parallel and batch-normalization branches.
+## Citing this work
+If you find this work useful in your research, please consider citing:
 
-
-# MPI Parallel
-
-This branch provides data parallelization for Caffe based on MPI.
-
-## Installation
-
-- Install `openmpi` with `apt-get`, or `pacman`, or `yum`, etc.
-- Uncomment the MPI parallel block in the Makefile.config and set the `MPI_INCLUDE` and `MPI_LIB` correspondingly.
-- `make clean && make -j`
-
-## Usage
-
-You don't need to change your prototxt. Just provide the GPU ids in the `-gpu` option (separated by commas). For example:
-
-    mpirun -n 2 build/tools/caffe train \
-      -solver examples/mnist/lenet_solver.prototxt \
-      -gpu 0,1
-
-
-# Batch Normalization
-
-This branch provides implementation of Batch Normalization (BN). Most of the codes are adpated from Chenglong Chen's [caffe-windows](https://github.com/ChenglongChen/caffe-windows).
-
-## Usage
-
-Just add a BN layer before each activation function. The configuration of a BN layer looks like:
-
-    layer {
-      name: "conv1_bn"
-      type: "BN"
-      bottom: "conv1"
-      top: "conv1_bn"
-      param {
-        lr_mult: 1
-        decay_mult: 0
-      }
-      param {
-        lr_mult: 1
-        decay_mult: 0
-      }
-      bn_param {
-        slope_filler {
-          type: "constant"
-          value: 1
-        }
-        bias_filler {
-          type: "constant"
-          value: 0
-        }
-      }
+    @inproceedings{songCVPR16,
+        Author = {Hyun Oh Song and Yu Xiang and Stefanie Jegelka and Silvio Savarese},
+        Title = {Deep Metric Learning via Lifted Structured Feature Embedding},
+        Booktitle = {CVPR},
+        Year = {2016}
     }
 
-We also implement a simple version of local data shuffling in the data layer. It's recommended to set `shuffle_pool_size: 10` in `data_param` of the training data layer.
+## Installation
+1. Install prerequisites for `Caffe` (see: [Caffe installation instructions](http://caffe.berkeleyvision.org/installation.html))
+
+2. Compile this caffe extension. 
+Run `make all`,  `make test`
+
+## Licence
+MIT Licence

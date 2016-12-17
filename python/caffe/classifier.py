@@ -40,6 +40,8 @@ class Classifier(caffe.Net):
             self.transformer.set_channel_swap(in_, channel_swap)
 
         self.crop_dims = np.array(self.blobs[in_].data.shape[2:])
+        if not image_dims:
+            image_dims = self.crop_dims
         self.image_dims = image_dims
 
     def predict(self, inputs, oversample=True):
@@ -59,37 +61,25 @@ class Classifier(caffe.Net):
             classes.
         """
         # Scale to standardize input dimensions.
-        if self.image_dims is not None:
-            input_ = np.zeros((len(inputs),
-                               self.image_dims[0],
-                               self.image_dims[1],
-                               inputs[0].shape[2]),
-                              dtype=np.float32)
-            for ix, in_ in enumerate(inputs):
-                input_[ix] = caffe.io.resize_image(in_, self.image_dims)
-        else:
-            input_ = inputs
+        input_ = np.zeros((len(inputs),
+                           self.image_dims[0],
+                           self.image_dims[1],
+                           inputs[0].shape[2]),
+                          dtype=np.float32)
+        for ix, in_ in enumerate(inputs):
+            input_[ix] = caffe.io.resize_image(in_, self.image_dims)
 
         if oversample:
             # Generate center, corner, and mirrored crops.
             input_ = caffe.io.oversample(input_, self.crop_dims)
         else:
             # Take center crop.
-            if self.image_dims is not None:
-                center = np.array(self.image_dims) / 2.0
-                crop = np.tile(center, (1, 2))[0] + np.concatenate([
-                    -self.crop_dims / 2.0,
-                    self.crop_dims / 2.0
-                ])
-                input_ = input_[:, crop[0]:crop[2], crop[1]:crop[3], :]
-            else:
-                input_ = []
-                for im in inputs:
-                    center = np.asarray(im.shape[:2]) / 2.0
-                    crop = np.tile(center, (1, 2))[0] + np.concatenate([
-                        -self.crop_dims / 2.0, self.crop_dims / 2.0])
-                    input_.append(im[crop[0]:crop[2], crop[1]:crop[3], :])
-                input_ = np.asarray(input_).astype(np.float32)
+            center = np.array(self.image_dims) / 2.0
+            crop = np.tile(center, (1, 2))[0] + np.concatenate([
+                -self.crop_dims / 2.0,
+                self.crop_dims / 2.0
+            ])
+            input_ = input_[:, crop[0]:crop[2], crop[1]:crop[3], :]
 
         # Classify
         caffe_in = np.zeros(np.array(input_.shape)[[0, 3, 1, 2]],

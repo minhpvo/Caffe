@@ -18,6 +18,10 @@
 
 #include "caffe/util/device_alternate.hpp"
 
+// Convert macro to string
+#define STRINGIFY(m) #m
+#define AS_STRING(m) STRINGIFY(m)
+
 // gflags 2.1 issue: namespace google was changed to gflags without warning.
 // Luckily we will be able to use GFLAGS_GFLAGS_H_ to detect if it is version
 // 2.1. If yes, we will add a temporary solution to redirect the namespace.
@@ -93,20 +97,17 @@ using std::vector;
 // Currently it initializes google flags and google logging.
 void GlobalInit(int* pargc, char*** pargv);
 
-// A global function to clear up remaining stuffs.
-void GlobalFinalize();
-
 // A singleton class to hold common caffe stuff, such as the handler that
 // caffe is going to use for cublas, curand, etc.
 class Caffe {
  public:
   ~Caffe();
-  inline static Caffe& Get() {
-    if (!singleton_.get()) {
-      singleton_.reset(new Caffe());
-    }
-    return *singleton_;
-  }
+
+  // Thread local context for Caffe. Moved to common.cpp instead of
+  // including boost/thread.hpp to avoid a boost/NVCC issues (#1009, #1010)
+  // on OSX. Also fails on Linux with CUDA 7.0.18.
+  static Caffe& Get();
+
   enum Brew { CPU, GPU };
 
   // This random number generator facade hides boost and CUDA rng
@@ -152,18 +153,16 @@ class Caffe {
   static void SetDevice(const int device_id);
   // Prints the current GPU status.
   static void DeviceQuery();
-#ifdef USE_MPI
-  inline static int mpi_rank() { return Get().mpi_rank_; }
-  inline static int mpi_size() { return Get().mpi_size_; }
-  inline static int mpi_initialized() { return Get().mpi_initialized_; }
-#endif
-
-#ifdef USE_CUDNN
-  inline static int cudnn_mem_richness() { return Get().cudnn_mem_richness_; }
-  inline static void set_cudnn_mem_richness(int richness) {
-    Get().cudnn_mem_richness_ = richness;
-  }
-#endif
+  // Check if specified device is available
+  static bool CheckDevice(const int device_id);
+  // Search from start_id to the highest possible device ordinal,
+  // return the ordinal of the first available device.
+  static int FindDevice(const int start_id = 0);
+  // Parallel training info
+  inline static int solver_count() { return Get().solver_count_; }
+  inline static void set_solver_count(int val) { Get().solver_count_ = val; }
+  inline static bool root_solver() { return Get().root_solver_; }
+  inline static void set_root_solver(bool val) { Get().root_solver_ = val; }
 
  protected:
 #ifndef CPU_ONLY
@@ -173,17 +172,8 @@ class Caffe {
   shared_ptr<RNG> random_generator_;
 
   Brew mode_;
-  static shared_ptr<Caffe> singleton_;
-
-#ifdef USE_MPI
-  int mpi_rank_;
-  int mpi_size_;
-  int mpi_initialized_;
-#endif
-
-#ifdef USE_CUDNN
-  int cudnn_mem_richness_;
-#endif
+  int solver_count_;
+  bool root_solver_;
 
  private:
   // The private constructor to avoid duplicate instantiation.

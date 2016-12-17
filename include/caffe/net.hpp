@@ -23,19 +23,25 @@ namespace caffe {
 template <typename Dtype>
 class Net {
  public:
-  explicit Net(const NetParameter& param);
-  explicit Net(const string& param_file, Phase phase);
+  explicit Net(const NetParameter& param, const Net* root_net = NULL);
+  explicit Net(const string& param_file, Phase phase,
+      const Net* root_net = NULL);
   virtual ~Net() {}
 
   /// @brief Initialize a network with a NetParameter.
   void Init(const NetParameter& param);
 
   /**
-   * @brief Run Forward with the input Blob%s already fed separately.
+   * @brief Run Forward and return the result.
    *
-   * You can get the input blobs using input_blobs().
    */
-  const vector<Blob<Dtype>*>& ForwardPrefilled(Dtype* loss = NULL);
+  const vector<Blob<Dtype>*>& Forward(Dtype* loss = NULL);
+  /// @brief DEPRECATED; use Forward() instead.
+  const vector<Blob<Dtype>*>& ForwardPrefilled(Dtype* loss = NULL) {
+    LOG_EVERY_N(WARNING, 1000) << "DEPRECATED: ForwardPrefilled() "
+        << "will be removed in a future version. Use Forward().";
+    return Forward(loss);
+  }
 
   /**
    * The From and To variants of Forward and Backward operate on the
@@ -48,14 +54,9 @@ class Net {
   Dtype ForwardFromTo(int start, int end);
   Dtype ForwardFrom(int start);
   Dtype ForwardTo(int end);
-  /// @brief Run forward using a set of bottom blobs, and return the result.
+  /// @brief DEPRECATED; set input blobs then use Forward() instead.
   const vector<Blob<Dtype>*>& Forward(const vector<Blob<Dtype>* > & bottom,
       Dtype* loss = NULL);
-  /**
-   * @brief Run forward using a serialized BlobProtoVector and return the
-   *        result as a serialized BlobProtoVector
-   */
-  string Forward(const string& input_blob_protos, Dtype* loss = NULL);
 
   /**
    * @brief Zeroes out the diffs of all net parameters.
@@ -68,10 +69,10 @@ class Net {
    * computes the gradient w.r.t the parameters, and the data has already been
    * provided during the forward pass.
    */
-  void Backward(int remaining_sub_iter = 0);
-  void BackwardFromTo(int start, int end, int remaining_sub_iter = 0);
-  void BackwardFrom(int start, int remaining_sub_iter = 0);
-  void BackwardTo(int end, int remaining_sub_iter = 0);
+  void Backward();
+  void BackwardFromTo(int start, int end);
+  void BackwardFrom(int start);
+  void BackwardTo(int end);
 
   /**
    * @brief Reshape all layers from bottom to top.
@@ -81,11 +82,10 @@ class Net {
    */
   void Reshape();
 
-  Dtype ForwardBackward(const vector<Blob<Dtype>* > & bottom,
-                        int remaining_sub_iter = 0) {
+  Dtype ForwardBackward() {
     Dtype loss;
-    Forward(bottom, &loss);
-    Backward(remaining_sub_iter);
+    Forward(&loss);
+    Backward();
     return loss;
   }
 
@@ -119,13 +119,6 @@ class Net {
   /// @brief Writes the net to an HDF5 file.
   void ToHDF5(const string& filename, bool write_diff = false) const;
 
-#ifdef USE_MPI
-  // Synchronize the parameters of each layer among all the MPI processors.
-  void SyncData();
-  void SyncDiff();
-  void SyncOutput();
-#endif
-
   /// @brief returns the network name.
   inline const string& name() const { return name_; }
   /// @brief returns the layer names
@@ -155,6 +148,18 @@ class Net {
    */
   inline const vector<vector<Blob<Dtype>*> >& top_vecs() const {
     return top_vecs_;
+  }
+  /// @brief returns the ids of the top blobs of layer i
+  inline const vector<int> & top_ids(int i) const {
+    CHECK_GE(i, 0) << "Invalid layer id";
+    CHECK_LT(i, top_id_vecs_.size()) << "Invalid layer id";
+    return top_id_vecs_[i];
+  }
+  /// @brief returns the ids of the bottom blobs of layer i
+  inline const vector<int> & bottom_ids(int i) const {
+    CHECK_GE(i, 0) << "Invalid layer id";
+    CHECK_LT(i, bottom_id_vecs_.size()) << "Invalid layer id";
+    return bottom_id_vecs_[i];
   }
   inline const vector<vector<bool> >& bottom_need_backward() const {
     return bottom_need_backward_;
@@ -186,9 +191,8 @@ class Net {
     return param_names_index_;
   }
   inline const vector<int>& param_owners() const { return param_owners_; }
-  /// @brief returns the layer and index of the parameters
-  inline const vector<pair<int, int> >& param_layer_indices() const {
-    return param_layer_indices_;
+  inline const vector<string>& param_display_names() const {
+    return param_display_names_;
   }
   /// @brief Input and output blob numbers
   inline int num_inputs() const { return net_input_blobs_.size(); }
@@ -223,13 +227,9 @@ class Net {
   static bool StateMeetsRule(const NetState& state, const NetStateRule& rule,
       const string& layer_name);
 
-#ifdef USE_MPI
-  inline const set<string>& serial_layers() const { return serial_layers_; }
-#endif
-
  protected:
   // Helpers for Init.
-  /// @brief Append a new input or top blob to the net.
+  /// @brief Append a new top blob to the net.
   void AppendTop(const NetParameter& param, const int layer_id,
                  const int top_id, set<string>* available_blobs,
                  map<string, int>* blob_name_to_idx);
@@ -241,19 +241,12 @@ class Net {
   void AppendParam(const NetParameter& param, const int layer_id,
                    const int param_id);
 
-  /// @brief Helper for displaying debug info in Forward about input Blobs.
-  void InputDebugInfo(const int layer_id);
   /// @brief Helper for displaying debug info in Forward.
   void ForwardDebugInfo(const int layer_id);
   /// @brief Helper for displaying debug info in Backward.
   void BackwardDebugInfo(const int layer_id);
   /// @brief Helper for displaying debug info in Update.
   void UpdateDebugInfo(const int param_id);
-
-#ifdef USE_MPI
-  /// @brief Determine whether a layer should be in parallel or serial.
-  void DetermineLayerParallelOrSerial(const NetParameter& param);
-#endif
 
   /// @brief The network name
   string name_;
@@ -312,12 +305,8 @@ class Net {
   size_t memory_used_;
   /// Whether to compute and display debug info for the net.
   bool debug_info_;
-
-#ifdef USE_MPI
-  /// The layers in serialization.
-  set<string> serial_layers_;
-#endif
-
+  /// The root net that actually holds the shared layers in data parallelism
+  const Net* const root_net_;
   DISABLE_COPY_AND_ASSIGN(Net);
 };
 
